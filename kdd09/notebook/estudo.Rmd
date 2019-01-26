@@ -1,0 +1,607 @@
+---
+title: "KDD Customer Analysis"
+output: html_notebook
+---
+
+Está é uma análise baseada na competição KDD Cup 2009 cujo objetivo é predizer as taxas de saída de cliente (Churn), clientes de novos produtos (apettency) e clientes de upgrade (up-selling).
+
+```{r}
+library(caret)
+library(tidyverse)
+library(xgboost)
+library(DMwR)
+
+library(doParallel)
+
+set.seed(1234)
+```
+
+```{r}
+data <- read.table('../data/orange_small_train.data',
+                header=T,sep='\t',na.strings=c('NA',''), stringsAsFactors = F)
+churn <- read.table('../data/orange_small_train_churn.labels',
+                    header=F,sep='\t')
+
+appetency <- read.table('../data/orange_small_train_appetency.labels',
+                        header=F,sep='\t')
+
+upselling <- read.table('../data/orange_small_train_upselling.labels',
+                        header=F,sep='\t')
+
+```
+
+```{r}
+data_churn <- data
+data_churn$churn <- churn$V1
+#clean variables with more than 25% of NA
+data_churn <- data_churn[, -which(colMeans(is.na(data_churn)) > 0.2)] # only 66 variables remains
+
+var_strings <- data_churn %>%
+  Filter(f = is.character) %>%
+  names
+
+var_numeric <- data_churn %>%
+  Filter(f = is.numeric) %>%
+  names
+
+for(f in var_strings){
+  ntop5 <- names(sort(table(data_churn[[f]]),decreasing = T)[-(1:3)])
+  if(!is_empty(ntop5)){
+    data_churn[[f]][data_churn[[f]] %in% ntop5] <- "MoreThan5" 
+  }
+}
+
+for(f in var_strings){
+  data_churn[[f]][is.na(data_churn[[f]])] <- "unknown"
+}
+
+for(f in var_numeric){
+  data_churn[[f]][is.na(data_churn[[f]])] <- mean(data_churn[[f]], na.rm = T)
+}
+
+
+dummies <- dummyVars(churn ~ ., data= data_churn, sep="_")
+ext_data <- predict(dummies, newdata = data_churn)
+ext_data <- data.frame(ext_data)
+ext_data$churn <- data_churn$churn
+ext_data$churn[ext_data$churn == -1] <- 0
+# ext_data$churn[ext_data$churn == 1] <- 'yes'
+# ext_data$churn <- as.factor(ext_data$churn)
+```
+
+```{r}
+#separate train/validation
+
+trainIndex <- createDataPartition(ext_data$churn, p = .7, 
+                                  list = FALSE, 
+                                  times = 1)
+imbal_train <- ext_data[trainIndex,]
+teste_matrix <- ext_data[-trainIndex,]
+
+cat_churn <- as.factor(imbal_train[,"churn"])
+levels(cat_churn) <- c("no", "yes")
+
+train_down <- downSample(x = imbal_train[, -ncol(imbal_train)],
+                           y = cat_churn)
+
+w <- sum(data_churn$churn == -1)/sum(data_churn$churn == 1)
+dtrain <- xgb.DMatrix(data = data.matrix(imbal_train[, -ncol(imbal_train)]), label = imbal_train$churn)
+bstDMatrix <- xgboost(data = dtrain,
+                      max.depth = 3,
+                      eta = 0.1,
+                      colsample_bytree = 0.9,
+                      subsample = 0.9,
+                      min_child_weight = 0,
+                      nthread = 2,
+                      nrounds = 100,
+                      print_every_n = 100,
+                      objective = "binary:logistic",
+                      eval_metric = "auc",
+                      # max_delta_step = 1)
+                      scale_pos_weight = w)
+
+predicted <- predict(bstDMatrix, newdata = data.matrix(teste_matrix[, -ncol(teste_matrix)]))
+predicted <- ifelse(predicted > 0.5, 1, 0)
+observed <- teste_matrix$churn
+table(observed,predicted)
+ModelMetrics::auc(observed,predicted)
+sum(observed == predicted)/length(predicted)
+```
+
+
+```{r}
+importance <- xgb.importance(feature_names = colnames(dtrain), model = bstDMatrix)
+head(importance)
+
+bestCols <- importance$Feature[1:20]
+dtrain <- xgb.DMatrix(data = data.matrix(imbal_train[, bestCols]), label = imbal_train$churn)
+bstDMatrix <- xgboost(data = dtrain,
+                      max.depth = 2,
+                      eta = 0.3,
+                      nthread = 2,
+                      nrounds = 20,
+                      print_every_n = 10,
+                      objective = "binary:logistic",
+                      eval_metric = "auc",
+                      scale_pos_weight = w)
+
+predicted <- predict(bstDMatrix, newdata = data.matrix(teste_matrix[, bestCols]))
+predicted <- ifelse(predicted > 0.5, 1, 0)
+observed <- teste_matrix$churn
+table(observed,predicted)
+ModelMetrics::auc(observed,predicted)
+```
+
+```{r}
+parametersGrid <-  expand.grid(
+  eta = 0.1, 
+  colsample_bytree=c(0.8,0.9),
+  max_depth=c(6,8),
+  nrounds=200,
+  gamma=1,
+  min_child_weight=2,
+  subsample = 0.9
+  )
+
+ControlParamteres <- trainControl(
+  method = "cv",
+  number = 5,
+  savePredictions = TRUE,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary
+  )
+
+```
+
+```{r}
+cl <- makePSOCKcluster(3)
+registerDoParallel(cl)
+
+model_churn_down <- train(Class~., 
+                  data = train_down,
+                  method = "xgbTree",
+                  trControl = ControlParamteres,
+                  tuneGrid = data.frame(eta = 0.1,
+                                        colsample_bytree= 0.9,
+                                        max_depth= 8,
+                                        nrounds=20,
+                                        gamma=1,
+                                        min_child_weight=2,
+                                        subsample = 0.9),
+                  metric="ROC")
+stopCluster(cl)
+model_churn_down
+
+col_down <- rownames(varImp(model_churn_down)$importance)[1:20]
+
+
+cl <- makePSOCKcluster(3)
+registerDoParallel(cl)
+
+model20_churn_down <- train(Class~., 
+                  data = train_down[, c(col_down, "Class")],
+                  method = "xgbTree",
+                  trControl = ControlParamteres,
+                  tuneGrid = data.frame(eta = 0.1,
+                                        colsample_bytree= 0.9,
+                                        max_depth= 8,
+                                        nrounds=200,
+                                        gamma=1,
+                                        min_child_weight=2,
+                                        subsample = 0.9),
+                  metric="ROC")
+stopCluster(cl)
+model20_churn_down
+
+
+
+```
+
+```{r}
+predicted <- predict(model_churn_up, newdata = teste_matrix)
+observed <- teste_matrix$churn
+probs <- predict(model_churn_up, newdata = teste_matrix, type = "prob")
+new_data <- data.frame(obs = observed,
+                       pred = predicted,
+                       yes = probs$yes,
+                       no = probs$no)
+classes <- c("no","yes")
+twoClassSummary(new_data, lev=classes)
+table(observed,predicted)
+
+predicted <- predict(model20_churn_up, newdata = teste_matrix[,col_up])
+observed <- teste_matrix$churn
+probs <- predict(model20_churn_up, newdata = teste_matrix[,col_up], type = "prob")
+new_data <- data.frame(obs = observed,
+                       pred = predicted,
+                       yes = probs$yes,
+                       no = probs$no)
+classes <- c("no","yes")
+twoClassSummary(new_data, lev=classes)
+table(observed,predicted)
+
+
+predicted <- predict(model_churn_down, newdata = teste_matrix)
+observed <- teste_matrix$churn
+probs <- predict(model_churn_down, newdata = teste_matrix, type = "prob")
+new_data <- data.frame(obs = observed,
+                       pred = predicted,
+                       yes = probs$yes,
+                       no = probs$no)
+classes <- c("no","yes")
+twoClassSummary(new_data, lev=classes)
+table(observed,predicted)
+# Down
+# ROC      Sens      Spec 
+# 0.7167216 0.6399482 0.6684832
+
+predicted <- predict(model20_churn_down, newdata = teste_matrix[,col_down])
+observed <- teste_matrix$churn
+probs <- predict(model20_churn_down, newdata = teste_matrix[,col_down], type = "prob")
+new_data <- data.frame(obs = observed,
+                       pred = predicted,
+                       yes = probs$yes,
+                       no = probs$no)
+classes <- c("no","yes")
+twoClassSummary(new_data, lev=classes)
+table(observed,predicted)
+
+predicted <- predict(model_churn_smote, newdata = teste_matrix)
+observed <- teste_matrix$churn
+probs <- predict(model_churn_smote, newdata = teste_matrix, type = "prob")
+new_data <- data.frame(obs = observed,
+                       pred = predicted,
+                       yes = probs$yes,
+                       no = probs$no)
+classes <- c("no","yes")
+twoClassSummary(new_data, lev=classes)
+table(observed,predicted)
+
+predicted <- predict(model20_churn_smote, newdata = teste_matrix[, col_smote])
+observed <- teste_matrix$churn
+probs <- predict(model20_churn_smote, newdata = teste_matrix[, col_smote], type = "prob")
+new_data <- data.frame(obs = observed,
+                       pred = predicted,
+                       yes = probs$yes,
+                       no = probs$no)
+classes <- c("no","yes")
+twoClassSummary(new_data, lev=classes)
+table(observed,predicted)
+
+# predicted <- predict(model_churn_up_gbm, newdata = teste_matrix)
+# observed <- teste_matrix$churn
+# probs <- predict(model_churn_up_gbm, newdata = teste_matrix, type = "prob")
+# new_data <- data.frame(obs = observed,
+#                        pred = predicted,
+#                        yes = probs$yes,
+#                        no = probs$no)
+# classes <- c("no","yes")
+# twoClassSummary(new_data, lev=classes)
+# table(observed,predicted)
+# 
+# predicted <- predict(model_churn_down_gbm, newdata = teste_matrix)
+# observed <- teste_matrix$churn
+# probs <- predict(model_churn_down_gbm, newdata = teste_matrix, type = "prob")
+# new_data <- data.frame(obs = observed,
+#                        pred = predicted,
+#                        yes = probs$yes,
+#                        no = probs$no)
+# classes <- c("no","yes")
+# twoClassSummary(new_data, lev=classes)
+# table(observed,predicted)
+# 
+# predicted <- predict(model_churn_smote_gbm, newdata = teste_matrix)
+# observed <- teste_matrix$churn
+# probs <- predict(model_churn_smote_gbm, newdata = teste_matrix, type = "prob")
+# new_data <- data.frame(obs = observed,
+#                        pred = predicted,
+#                        yes = probs$yes,
+#                        no = probs$no)
+# classes <- c("no","yes")
+# twoClassSummary(new_data, lev=classes)
+# table(observed,predicted)
+```
+```{r}
+train2_up <- predict(model20_churn_up, newdata = imbal_train[,col_up])
+train2_down <- predict(model20_churn_down, newdata = imbal_train[,col_down])
+train2_smote <- predict(model20_churn_smote, newdata = imbal_train[,col_smote])
+
+train_df <- cbind(up = train2_up,down = train2_down, smote = train2_smote)
+train_df <- data.frame(train_df)
+train_df$churn <- imbal_train$churn
+train_df$up <- train_df$up - 1
+train_df$down <- train_df$down - 1
+train_df$smote <- train_df$smote - 1
+
+ControlParamteres <- trainControl(
+  method = "cv",
+  number = 5,
+  savePredictions = TRUE,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary
+  )
+
+cl <- makePSOCKcluster(3)
+registerDoParallel(cl)
+
+model_churn_ens <- train(churn~., 
+                  data = train_df,
+                  method = "glm",
+                  trControl = ControlParamteres,
+                  # tuneGrid = data.frame(n.trees = 150,
+                  #                       interaction.depth = 2,
+                  #                       shrinkage = 0.1,
+                  #                       n.minobsinnode = 10),
+                  metric="ROC")
+
+stopCluster(cl)
+
+model_churn_ens
+
+test_up <- predict(model20_churn_up, newdata = teste_matrix[,col_up])
+test_down <- predict(model20_churn_down, newdata = teste_matrix[,col_down])
+test_smote <- predict(model20_churn_smote, newdata = teste_matrix[,col_smote])
+
+test_df <- cbind(up = test_up,down = test_down, smote = test_smote)
+test_df <- data.frame(test_df)
+test_df$churn <- teste_matrix$churn
+test_df$up <- test_df$up - 1
+test_df$down <- test_df$down - 1
+test_df$smote <- test_df$smote - 1
+
+
+predicted <- predict(model_churn_ens, newdata = test_df)
+observed <- test_df$churn
+probs <- predict(model_churn_ens, newdata = test_df, type = "prob")
+new_data <- data.frame(obs = observed,
+                       pred = predicted,
+                       yes = probs$yes,
+                       no = probs$no)
+classes <- c("no","yes")
+twoClassSummary(new_data, lev=classes)
+table(observed,predicted)
+```
+
+```{r}
+data_appetency <- data
+data_appetency$appetency <- appetency$V1
+#clean variables with more than 20% of NA
+data_appetency <- data_appetency[, -which(colMeans(is.na(data_appetency)) > 0.9)] # only 66 variables remains
+
+var_strings <- data_appetency %>%
+  Filter(f = is.character) %>%
+  names
+
+var_numeric <- data_appetency %>%
+  Filter(f = is.numeric) %>%
+  names
+
+for(f in var_strings){
+  ntop5 <- names(sort(table(data_appetency[[f]]),decreasing = T)[-(1:3)])
+  if(!is_empty(ntop5)){
+    data_appetency[[f]][data_appetency[[f]] %in% ntop5] <- "HasMore" 
+  }
+}
+
+for(f in var_strings){
+  data_appetency[[f]][is.na(data_appetency[[f]])] <- "unknown"
+}
+
+for(f in var_numeric){
+  data_appetency[[f]][is.na(data_appetency[[f]])] <- mean(data_appetency[[f]], na.rm = T)
+}
+
+
+dummies <- dummyVars(appetency ~ ., data= data_appetency, sep="_")
+ext_data <- predict(dummies, newdata = data_appetency)
+ext_data <- data.frame(ext_data)
+ext_data$appetency <- data_appetency$appetency
+ext_data$appetency[ext_data$appetency == -1] <- 'no'
+ext_data$appetency[ext_data$appetency == 1] <- 'yes'
+ext_data$appetency <- as.factor(ext_data$appetency)
+```
+
+```{r}
+#separate train/validation
+
+trainIndex <- createDataPartition(ext_data$appetency, p = .7, 
+                                  list = FALSE, 
+                                  times = 1)
+imbal_train <- ext_data[trainIndex,]
+teste_matrix <- ext_data[-trainIndex,]
+
+
+# train_matrix <- SMOTE(appetency ~ ., data  = imbal_train)   
+
+# train_matrix <- upSample(x = imbal_train[, -ncol(imbal_train)],
+#                          y = imbal_train[,"appetency"])    
+
+train_matrix <- downSample(x = imbal_train[, -ncol(imbal_train)],
+                           y = imbal_train[,"appetency"])
+```
+
+```{r}
+parametersGrid <-  expand.grid(
+  eta = 0.1, 
+  colsample_bytree=c(0.8,0.9),
+  max_depth=c(6,8),
+  nrounds=200,
+  gamma=1,
+  min_child_weight=2,
+  subsample = 0.9
+  )
+
+ControlParamteres <- trainControl(
+  method = "cv",
+  number = 5,
+  savePredictions = TRUE,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary
+  )
+
+```
+
+```{r}
+cl <- makePSOCKcluster(3)
+registerDoParallel(cl)
+
+model_appetency <- train(Class~., 
+                  data = train_matrix,
+                  method = "xgbTree",
+                  trControl = ControlParamteres,
+                  tuneGrid = data.frame(eta = 0.1,
+                                        colsample_bytree= 0.8,
+                                        max_depth= 8,
+                                        nrounds=100,
+                                        gamma=1,
+                                        min_child_weight=2,
+                                        subsample = 0.8),
+                  metric="ROC")
+stopCluster(cl)
+model_appetency
+```
+
+```{r}
+predicted <- predict(model_appetency, newdata = teste_matrix)
+observed <- teste_matrix$appetency
+probs <- predict(model_appetency, newdata = teste_matrix, type = "prob")
+new_data <- data.frame(obs = observed,
+                       pred = predicted,
+                       yes = probs$yes,
+                       no = probs$no)
+classes <- c("no","yes")
+table(observed, predicted)
+twoClassSummary(new_data, lev=classes) #old ROC .5141
+```
+
+```{r}
+cl <- makePSOCKcluster(3)
+registerDoParallel(cl)
+
+model_appetency <- train(appetency~., 
+                  data = imbal_train,
+                  method = "rf",
+                  trControl = ControlParamteres,
+                  tuneGrid = data.frame(mtry = 9),
+                  metric="ROC")
+stopCluster(cl)
+model_appetency
+```
+
+
+```{r}
+data_upselling <- data
+data_upselling$upselling <- upselling$V1
+#clean variables with more than 25% of NA
+data_upselling <- data_upselling[, -which(colMeans(is.na(data_upselling)) > 0.9)] # only 66 variables remains
+
+var_strings <- data_upselling %>%
+  Filter(f = is.character) %>%
+  names
+
+var_numeric <- data_upselling %>%
+  Filter(f = is.numeric) %>%
+  names
+
+for(f in var_strings){
+  ntop5 <- names(sort(table(data_upselling[[f]]),decreasing = T)[-(1:3)])
+  if(!is_empty(ntop5)){
+    data_upselling[[f]][data_upselling[[f]] %in% ntop5] <- "MoreThan5" 
+  }
+}
+
+for(f in var_strings){
+  data_upselling[[f]][is.na(data_upselling[[f]])] <- "unknown"
+}
+
+for(f in var_numeric){
+  data_upselling[[f]][is.na(data_upselling[[f]])] <- mean(data_upselling[[f]], na.rm = T)
+}
+
+
+dummies <- dummyVars(upselling ~ ., data= data_upselling, sep="_")
+ext_data <- predict(dummies, newdata = data_upselling)
+ext_data <- data.frame(ext_data)
+ext_data$upselling <- data_upselling$upselling
+ext_data$upselling[ext_data$upselling == -1] <- 'no'
+ext_data$upselling[ext_data$upselling == 1] <- 'yes'
+ext_data$upselling <- as.factor(ext_data$upselling)
+```
+
+```{r}
+#separate train/validation
+
+trainIndex <- createDataPartition(ext_data$upselling, p = .7, 
+                                  list = FALSE, 
+                                  times = 1)
+imbal_train <- ext_data[trainIndex,]
+teste_matrix <- ext_data[-trainIndex,]
+
+# train_matrix <- upSample(x = imbal_train[, -ncol(imbal_train)],
+#                          y = imbal_train[,"upselling"])                         
+
+train_matrix <- downSample(x = imbal_train[, -ncol(imbal_train)],
+                           y = imbal_train[,"upselling"]) 
+```
+
+```{r}
+parametersGrid <-  expand.grid(
+  eta = 0.1, 
+  colsample_bytree=c(0.8,0.9),
+  max_depth=c(6,8),
+  nrounds=200,
+  gamma=1,
+  min_child_weight=2,
+  subsample = 0.9
+  )
+
+ControlParamteres <- trainControl(
+  method = "cv",
+  number = 5,
+  savePredictions = TRUE,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary
+  )
+
+```
+
+```{r}
+
+cl <- makePSOCKcluster(3)
+registerDoParallel(cl)
+
+
+model_upselling <- train(Class~., 
+                  data = train_matrix,
+                  method = "xgbTree",
+                  trControl = ControlParamteres,
+                  tuneGrid = data.frame(eta = 0.1,
+                                        colsample_bytree= 0.9,
+                                        max_depth= 8,
+                                        nrounds=200,
+                                        gamma=1,
+                                        min_child_weight=2,
+                                        subsample = 0.5),
+                  metric="ROC")
+stopCluster(cl)
+
+model_upselling
+```
+
+```{r}
+predicted <- predict(model_upselling, newdata = teste_matrix)
+observed <- teste_matrix$upselling
+probs <- predict(model_upselling, newdata = teste_matrix, type = "prob")
+new_data <- data.frame(obs = observed,
+                       pred = predicted,
+                       yes = probs$yes,
+                       no = probs$no)
+classes <- c("no","yes")
+twoClassSummary(new_data, lev=classes)
+```
+
+```{r}
+score <- (model_churn$results$ROC + model_appetency$results$ROC + model_upselling$results$ROC)/3
+score
+```
+

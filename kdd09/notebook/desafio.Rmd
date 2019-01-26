@@ -1,0 +1,298 @@
+---
+title: "Desafio Hekima"
+output:
+  html_document:
+    df_print: paged
+---
+
+Está é uma análise baseada na competição KDD Cup 2009 cujo objetivo é predizer as taxas de saída de cliente (Churn), clientes de novos produtos (apettency) e clientes de upgrade (up-selling).
+
+```{r}
+library(caret)
+library(tidyverse)
+library(xgboost)
+library(DMwR)
+
+library(doParallel)
+
+set.seed(1234)
+```
+
+## Leitura dos dados
+```{r}
+data <- read.table('../data/orange_small_train.data',
+                header=T,sep='\t',na.strings=c('NA',''), stringsAsFactors = F)
+churn <- read.table('../data/orange_small_train_churn.labels',
+                    header=F,sep='\t')
+
+appetency <- read.table('../data/orange_small_train_appetency.labels',
+                        header=F,sep='\t')
+
+upselling <- read.table('../data/orange_small_train_upselling.labels',
+                        header=F,sep='\t')
+
+```
+
+## Modelo de Churn
+
+### Preparação dos dados
+
+Para a preparação do dataset foram realizadas 4 operações principais:
+
+* Limpeza de variáveis com muitas informações ausentes > 99%
+
+A limpeza das categorias foi realizado par retirar aquelas que não apresentavam informações para o sistema, dado o baixo número de informações presentes. Com mais de 99% das amostras sem valor, a informação presente se torna mais ruído, atrapalhando a previsão.
+
+
+* Imputação das variáveis ausentes para utilização como predição
+
+O algoritmo utilizado será o Xgboost com árvores paralelas (Random Forest), por ser um modelo de árvores de decisão, ele faz um recorte no espaço para definir as classes pertencentes aquela região ou valor médio atribuído em caso de regressões. Isso faz com que a imputação da ausência de informações se torne uma informação. Ao utilizar o nível mais comum (moda) ou a media/mediana para valores numéricos para imputação, a informação da ausência de informação anterior é perdida e substituida por um valor genérico (média) que pode atrapalhar a execução do modelo. Por isso foi escolhido imputar a nova categoria "unknown" e o valor -999 para identificar aquelas amostras com informação ausente em cada variável.
+
+* Aglutinação das variáveis categóricas com mais de 10 níveis em um novo nível
+
+Algumas variáveis possuem muitos níveis, o que torna inviável o tratamento em certas configurações de computadores, e por esse motivo foram preservados os 10 níveis que mais se repetiam, e os restantes quando presentes foram subtituidos por um novo nível "hasMore", para ensinar ao modelo que essa variável possuia mais níveis antes e essa amostra era de um deles.
+
+* Codificação das variáveis categóricas em novas variáveis binárias
+
+Modelos de árvores são conhecidos por representarem e tratarem bem variáveis categóricas, contudo o algoritmo Xgboost não processa strings. Por conta disso é necesário realizar uma transformação das variáveis categóricas em binárias. Uma variável "Cor" que anteriormente possui os níveis "Azul", "Verde", "Vermelho" passa a ser 3 novas variáveis binárias "Cor_Azul", "Cor_Verde" e "Cor_Vermelho", as quais possuem os níveis 0 e 1. Isso permite que o algoritmo trate as variáveis, mas aumenta exponencialmente a dimensão do problema. Esse é o motivo da aglutinação realizada no passo anterior.
+
+Visto que o dataset é o mesmo para os três problemas, o dataset foi replicado e a mesma preparação acontence nos três momentos.
+
+É importante comentar que o dataset apresenta severo desbalanceamento com apenas 7% de amostra positvas para churn, 2% para appetency e 7% para upselling. O algoritmo do Xgboost apresenta a opção de colocar pesos nas amostras durante o treinamento para influenciar a modelo ao balanceamento das amostras. Foram realizados testes sem os pesos, com modelos famosos para o tratamento desses casos reamostragem, subamostragem e geração de amostras artificiais, mas o modelo de pesos do próprio algoritmo foi superior.
+
+```{r}
+data_churn <- data
+data_churn$churn <- churn$V1
+#clean variables with more than 20% of NA
+data_churn <- data_churn[, -which(colMeans(is.na(data_churn)) > 0.99)] # only 66 variables remains
+
+var_strings <- data_churn %>%
+  Filter(f = is.character) %>%
+  names
+
+var_numeric <- data_churn %>%
+  Filter(f = is.numeric) %>%
+  names
+
+# Keep only most repeated levels
+for(f in var_strings){
+  nottop <- names(sort(table(data_churn[[f]]),decreasing = T)[-(1:10)])
+  if(!is_empty(nottop)){
+    data_churn[[f]][data_churn[[f]] %in% nottop] <- "hasMore" 
+  }
+}
+
+for(f in var_strings){
+  data_churn[[f]][is.na(data_churn[[f]])] <- "unknown"
+}
+
+for(f in var_numeric){
+  data_churn[[f]][is.na(data_churn[[f]])] <- -999
+}
+
+
+dummies <- dummyVars(churn ~ ., data= data_churn, sep="_")
+ext_data <- predict(dummies, newdata = data_churn)
+ext_data <- data.frame(ext_data)
+ext_data$churn <- data_churn$churn
+ext_data$churn[ext_data$churn == -1] <- 0
+```
+
+### Treinamento e Validação
+
+O algoritmo escolhido foi o Xgboost por ser um algoritmo de árvores e que por isso trabalha bem com dataset misto entre variáveis categóricas e numéricas. Ele também apresenta uma construção robusta que permite um processamento mais rápido, e consequentemente testar melhor seus parâmentros para encontrar a melhor combinação para esse problema.
+
+Dentre seus parâmentros alguns foram escolhidos de forma a minimizar a possibilidade de overfitting, que ocorre quando o modelo está muito apegado aos dados de treinamento, e não é capaz de generalizar seus resultados para dados desconhecidos. E assim o resultado de treinamento é excepcional, mas quando realizada a validação com dados que o modelo ainda não conhece, os dados de teste, o modelo apresenta resultados médiocres ou ruins.
+
+Os parâmetros *subsample* e *colsample_bytree* informam quanto do dataset será apresentado a cada árvore e modelo, gerando pontos cegos já durante o treinamento. O parâmetro *max_depth* influência quantos ramos as árvores terão, quanto mais ramos, mais o algoritmo tende a copiar os dados de treinamento. O último parâmetro a ser comentdo *num_parallel_tree* permite que o Xgboost copie a formula do algoritmo Random Forest e crie mais de uma árvore e compare as duas ao dar o resultado final melhorando sua confiança em um resultado e seu grau de acerto.
+
+```{r}
+#separate train/validation
+
+trainIndex <- createDataPartition(ext_data$churn, p = .7, 
+                                  list = FALSE, 
+                                  times = 1)
+imbal_train <- ext_data[trainIndex,]
+teste_matrix <- ext_data[-trainIndex,]
+
+
+w <- sum(data_churn$churn == -1)/sum(data_churn$churn == 1)
+dtrain <- xgb.DMatrix(data = data.matrix(imbal_train[, -ncol(imbal_train)]), label = imbal_train$churn)
+bstDMatrix <- xgboost(data = dtrain,
+                      max.depth = 3,
+                      eta = 0.2,
+                      gamma = 0,
+                      colsample_bytree = 0.7,
+                      subsample = 0.8,
+                      min_child_weight = 3,
+                      num_parallel_tree = 2,
+                      nthread = 3,
+                      nrounds = 50,
+                      print_every_n = 100,
+                      objective = "binary:logistic",
+                      eval_metric = "auc",
+                      scale_pos_weight = w)
+
+predicted <- predict(bstDMatrix, newdata = data.matrix(teste_matrix[, -ncol(teste_matrix)]))
+predicted <- ifelse(predicted > 0.5, 1, 0)
+observed <- teste_matrix$churn
+auc_churn <- ModelMetrics::auc(observed,predicted)
+auc_churn
+```
+
+## Modelo Appetency
+
+### Preparação dos Dados
+```{r}
+data_appetency <- data
+data_appetency$appetency <- appetency$V1
+#clean variables with more than 20% of NA
+data_appetency <- data_appetency[, -which(colMeans(is.na(data_appetency)) > 0.99)] 
+
+var_strings <- data_appetency %>%
+  Filter(f = is.character) %>%
+  names
+
+var_numeric <- data_appetency %>%
+  Filter(f = is.numeric) %>%
+  names
+
+for(f in var_strings){
+  nottop <- names(sort(table(data_appetency[[f]]),decreasing = T)[-(1:10)])
+  if(!is_empty(nottop)){
+    data_appetency[[f]][data_appetency[[f]] %in% nottop] <- "HasMore" 
+  }
+}
+
+for(f in var_strings){
+  data_appetency[[f]][is.na(data_appetency[[f]])] <- "unknown"
+}
+
+for(f in var_numeric){
+  data_appetency[[f]][is.na(data_appetency[[f]])] <- -999
+}
+
+
+dummies <- dummyVars(appetency ~ ., data= data_appetency, sep="_")
+ext_data <- predict(dummies, newdata = data_appetency)
+ext_data <- data.frame(ext_data)
+ext_data$appetency <- data_appetency$appetency
+ext_data$appetency[ext_data$appetency == -1] <- 0
+```
+
+### Treinamento e Validação
+```{r}
+#separate train/validation
+
+trainIndex <- createDataPartition(ext_data$appetency, p = .7, 
+                                  list = FALSE, 
+                                  times = 1)
+imbal_train <- ext_data[trainIndex,]
+teste_matrix <- ext_data[-trainIndex,]
+
+
+w <- sum(data_appetency$appetency == -1)/sum(data_appetency$appetency == 1)
+dtrain <- xgb.DMatrix(data = data.matrix(imbal_train[, -ncol(imbal_train)]), label = imbal_train$appetency)
+bstDMatrix <- xgboost(data = dtrain,
+                      max.depth = 3,
+                      eta = 0.2,
+                      gamma = 0,
+                      colsample_bytree = 0.7,
+                      subsample = 0.8,
+                      min_child_weight = 3,
+                      num_parallel_tree = 2,
+                      nthread = 3,
+                      nrounds = 50,
+                      print_every_n = 100,
+                      objective = "binary:logistic",
+                      eval_metric = "auc",
+                      scale_pos_weight = w)
+
+predicted <- predict(bstDMatrix, newdata = data.matrix(teste_matrix[, -ncol(teste_matrix)]))
+predicted <- ifelse(predicted > 0.5, 1, 0)
+observed <- teste_matrix$appetency
+auc_appetency <- ModelMetrics::auc(observed,predicted)
+auc_appetency
+```
+
+## Modelo Up-Selling
+
+### Preparação dos Dados
+```{r}
+data_upselling <- data
+data_upselling$upselling <- upselling$V1
+#clean variables with more than 20% of NA
+data_upselling <- data_upselling[, -which(colMeans(is.na(data_upselling)) > 0.99)] 
+
+var_strings <- data_upselling %>%
+  Filter(f = is.character) %>%
+  names
+
+var_numeric <- data_upselling %>%
+  Filter(f = is.numeric) %>%
+  names
+
+for(f in var_strings){
+  nottop <- names(sort(table(data_upselling[[f]]),decreasing = T)[-(1:10)])
+  if(!is_empty(nottop)){
+    data_upselling[[f]][data_upselling[[f]] %in% nottop] <- "HasMore" 
+  }
+}
+
+for(f in var_strings){
+  data_upselling[[f]][is.na(data_upselling[[f]])] <- "unknown"
+}
+
+for(f in var_numeric){
+  data_upselling[[f]][is.na(data_upselling[[f]])] <- -999
+}
+
+
+dummies <- dummyVars(upselling ~ ., data= data_upselling, sep="_")
+ext_data <- predict(dummies, newdata = data_upselling)
+ext_data <- data.frame(ext_data)
+ext_data$upselling <- data_upselling$upselling
+ext_data$upselling[ext_data$upselling == -1] <- 0
+```
+
+### Treinamento e Validação
+```{r}
+#separate train/validation
+
+trainIndex <- createDataPartition(ext_data$upselling, p = .7, 
+                                  list = FALSE, 
+                                  times = 1)
+imbal_train <- ext_data[trainIndex,]
+teste_matrix <- ext_data[-trainIndex,]
+
+
+w <- sum(imbal_train$upselling == 0)/sum(imbal_train$upselling == 1)
+dtrain <- xgb.DMatrix(data = data.matrix(imbal_train[, -ncol(imbal_train)]), label = imbal_train$upselling)
+bstDMatrix <- xgboost(data = dtrain,
+                      max.depth = 3,
+                      eta = 0.2,
+                      gamma = 0,
+                      colsample_bytree = 0.7,
+                      subsample = 0.8,
+                      min_child_weight = 3,
+                      num_parallel_tree = 2,
+                      nthread = 3,
+                      nrounds = 50,
+                      print_every_n = 100,
+                      objective = "binary:logistic",
+                      eval_metric = "auc",
+                      scale_pos_weight = w)
+
+predicted <- predict(bstDMatrix, newdata = data.matrix(teste_matrix[, -ncol(teste_matrix)]))
+predicted <- ifelse(predicted > 0.5, 1, 0)
+observed <- teste_matrix$upselling
+auc_upselling <- ModelMetrics::auc(observed,predicted)
+auc_upselling
+
+```
+
+```{r}
+score <- (auc_churn + auc_appetency + auc_upselling)/3
+score
+```
+

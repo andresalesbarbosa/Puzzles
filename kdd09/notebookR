@@ -1,0 +1,322 @@
+---
+title: "KDD Customer Analysis"
+output: html_notebook
+---
+
+Está é uma análise baseada na competição KDD Cup 2009 cujo objetivo é predizer as taxas de saída de cliente (Churn), clientes de novos produtos (apettency) e clientes de upgrade (up-selling).
+
+```{r}
+library(caret)
+library(tidyverse)
+library(xgboost)
+set.seed(1234)
+```
+
+```{r}
+data <- read.table('../data/orange_small_train.data',
+                header=T,sep='\t',na.strings=c('NA',''), stringsAsFactors = F)
+churn <- read.table('../data/orange_small_train_churn.labels',
+                    header=F,sep='\t')
+data_churn <- data
+data_churn$churn <- churn$V1
+appetency <- read.table('../data/orange_small_train_appetency.labels',
+                        header=F,sep='\t')
+data_appetency <- data
+data_appetency$appetency <- appetency$V1
+upselling <- read.table('../data/orange_small_train_upselling.labels',
+                        header=F,sep='\t')
+data_upselling <- data
+data_upselling$upselling <- upselling$V1
+
+```
+
+```{r}
+#clean variables with more than 25% of NA
+data_churn <- data_churn[, -which(colMeans(is.na(data_churn)) > 0.25)] # only 66 variables remains
+
+var_strings <- data_churn %>%
+  Filter(f = is.character) %>%
+  names
+
+var_numeric <- data_churn %>%
+  Filter(f = is.numeric) %>%
+  names
+
+for(f in var_strings){
+  ntop5 <- names(sort(table(data_churn[[f]]),decreasing = T)[-(1:5)])
+  if(!is_empty(ntop5)){
+    data_churn[[f]][data_churn[[f]] %in% ntop5] <- "MoreThan5" 
+  }
+}
+
+for(f in var_strings){
+  data_churn[[f]][is.na(data_churn[[f]])] <- "unknown"
+}
+
+for(f in var_numeric){
+  data_churn[[f]][is.na(data_churn[[f]])] <- mean(data_churn[[f]], na.rm = T)
+}
+
+
+dummies <- dummyVars(churn ~ ., data= data_churn, sep="_")
+ext_data <- predict(dummies, newdata = data_churn)
+ext_data <- data.frame(ext_data)
+ext_data$churn <- data_churn$churn
+ext_data$churn[ext_data$churn == -1] <- 'no'
+ext_data$churn[ext_data$churn == 1] <- 'yes'
+ext_data$churn <- as.factor(ext_data$churn)
+```
+
+```{r}
+#separate train/validation
+
+trainIndex <- createDataPartition(ext_data$churn, p = .7, 
+                                  list = FALSE, 
+                                  times = 1)
+imbal_train <- ext_data[trainIndex,]
+teste_matrix <- ext_data[-trainIndex,]
+
+train_matrix <- upSample(x = imbal_train[, -ncol(imbal_train)],
+                         y = imbal_train[,"churn"])                         
+```
+
+
+```{r}
+parametersGrid <-  expand.grid(
+  eta = 0.1, 
+  colsample_bytree=c(0.8,0.9),
+  max_depth=c(6,8),
+  nrounds=200,
+  gamma=1,
+  min_child_weight=2,
+  subsample = 0.9
+  )
+
+ControlParamteres <- trainControl(
+  method = "cv",
+  number = 5,
+  savePredictions = TRUE,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary
+  )
+
+```
+
+```{r}
+parametersGrid <-  expand.grid(
+  eta = 0.1, 
+  colsample_bytree= 0.9,
+  max_depth= 8,
+  nrounds=200,
+  gamma=1,
+  min_child_weight=2,
+  subsample = 0.9
+  )
+
+model_churn <- train(Class~., 
+                  data = train_matrix,
+                  method = "xgbTree",
+                  trControl = ControlParamteres,
+                  tuneGrid = parametersGrid,
+                  metric="ROC")
+model_churn
+```
+
+```{r}
+
+```
+
+
+```{r}
+#clean variables with more than 25% of NA
+data_appetency <- data_appetency[, -which(colMeans(is.na(data_appetency)) > 0.25)] # only 66 variables remains
+
+var_strings <- data_appetency %>%
+  Filter(f = is.character) %>%
+  names
+
+var_numeric <- data_appetency %>%
+  Filter(f = is.numeric) %>%
+  names
+
+for(f in var_strings){
+  ntop5 <- names(sort(table(data_appetency[[f]]),decreasing = T)[-(1:5)])
+  if(!is_empty(ntop5)){
+    data_appetency[[f]][data_appetency[[f]] %in% ntop5] <- "MoreThan5" 
+  }
+}
+
+for(f in var_strings){
+  data_appetency[[f]][is.na(data_appetency[[f]])] <- "unknown"
+}
+
+for(f in var_numeric){
+  data_appetency[[f]][is.na(data_appetency[[f]])] <- mean(data_appetency[[f]], na.rm = T)
+}
+
+
+dummies <- dummyVars(appetency ~ ., data= data_appetency, sep="_")
+ext_data <- predict(dummies, newdata = data_appetency)
+ext_data <- data.frame(ext_data)
+ext_data$appetency <- data_appetency$appetency
+ext_data$appetency[ext_data$appetency == -1] <- 'no'
+ext_data$appetency[ext_data$appetency == 1] <- 'yes'
+ext_data$appetency <- as.factor(ext_data$appetency)
+```
+
+```{r}
+#separate train/validation
+
+trainIndex <- createDataPartition(ext_data$appetency, p = .7, 
+                                  list = FALSE, 
+                                  times = 1)
+imbal_train <- ext_data[trainIndex,]
+teste_matrix <- ext_data[-trainIndex,]
+
+train_matrix <- upSample(x = imbal_train[, -ncol(imbal_train)],
+                         y = imbal_train[,"appetency"])                         
+```
+
+```{r}
+parametersGrid <-  expand.grid(
+  eta = 0.1, 
+  colsample_bytree=c(0.8,0.9),
+  max_depth=c(6,8),
+  nrounds=200,
+  gamma=1,
+  min_child_weight=2,
+  subsample = 0.9
+  )
+
+ControlParamteres <- trainControl(
+  method = "cv",
+  number = 5,
+  savePredictions = TRUE,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary
+  )
+
+```
+
+```{r}
+parametersGrid <-  expand.grid(
+  eta = 0.1, 
+  colsample_bytree=0.8,
+  max_depth= 8,
+  nrounds=200,
+  gamma=1,
+  min_child_weight=2,
+  subsample = 0.9
+  )
+
+model_appetency <- train(Class~., 
+                  data = train_matrix,
+                  method = "xgbTree",
+                  trControl = ControlParamteres,
+                  tuneGrid = parametersGrid,
+                  metric="ROC")
+model_appetency
+```
+
+```{r}
+#clean variables with more than 25% of NA
+data_upselling <- data_upselling[, -which(colMeans(is.na(data_upselling)) > 0.25)] # only 66 variables remains
+
+var_strings <- data_upselling %>%
+  Filter(f = is.character) %>%
+  names
+
+var_numeric <- data_upselling %>%
+  Filter(f = is.numeric) %>%
+  names
+
+for(f in var_strings){
+  ntop5 <- names(sort(table(data_upselling[[f]]),decreasing = T)[-(1:5)])
+  if(!is_empty(ntop5)){
+    data_upselling[[f]][data_upselling[[f]] %in% ntop5] <- "MoreThan5" 
+  }
+}
+
+for(f in var_strings){
+  data_upselling[[f]][is.na(data_upselling[[f]])] <- "unknown"
+}
+
+for(f in var_numeric){
+  data_upselling[[f]][is.na(data_upselling[[f]])] <- mean(data_upselling[[f]], na.rm = T)
+}
+
+
+dummies <- dummyVars(upselling ~ ., data= data_upselling, sep="_")
+ext_data <- predict(dummies, newdata = data_upselling)
+ext_data <- data.frame(ext_data)
+ext_data$upselling <- data_upselling$upselling
+ext_data$upselling[ext_data$upselling == -1] <- 'no'
+ext_data$upselling[ext_data$upselling == 1] <- 'yes'
+ext_data$upselling <- as.factor(ext_data$upselling)
+```
+
+```{r}
+#separate train/validation
+
+trainIndex <- createDataPartition(ext_data$upselling, p = .7, 
+                                  list = FALSE, 
+                                  times = 1)
+imbal_train <- ext_data[trainIndex,]
+teste_matrix <- ext_data[-trainIndex,]
+
+train_matrix <- upSample(x = imbal_train[, -ncol(imbal_train)],
+                         y = imbal_train[,"upselling"])                         
+```
+
+```{r}
+parametersGrid <-  expand.grid(
+  eta = 0.1, 
+  colsample_bytree=c(0.8,0.9),
+  max_depth=c(6,8),
+  nrounds=200,
+  gamma=1,
+  min_child_weight=2,
+  subsample = 0.9
+  )
+
+ControlParamteres <- trainControl(
+  method = "cv",
+  number = 5,
+  savePredictions = TRUE,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary
+  )
+
+```
+
+```{r}
+parametersGrid <-  expand.grid(
+  eta = 0.1, 
+  colsample_bytree= 0.9,
+  max_depth= 8,
+  nrounds=200,
+  gamma=1,
+  min_child_weight=2,
+  subsample = 0.9
+  )
+
+model_upselling <- train(Class~., 
+                  data = train_matrix,
+                  method = "xgbTree",
+                  trControl = ControlParamteres,
+                  tuneGrid = parametersGrid,
+                  metric="ROC")
+model_upselling
+```
+
+```{r}
+predict(model_upselling, newdata = head(teste_matrix))
+```
+
+
+```{r}
+score <- (model_churn$results$ROC + model_appetency$results$ROC + model_upselling$results$ROC)/3
+score
+```
+
+
